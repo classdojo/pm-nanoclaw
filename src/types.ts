@@ -30,6 +30,10 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  network?: string; // Docker network name (e.g., 'nanoclaw-pm-restricted')
+  allowedTools?: string[]; // Override default tool list for the container agent
+  additionalMcpServers?: Record<string, { url: string }>; // HTTP MCP servers accessible from container
+  model?: string; // Override the default model (e.g., 'claude-haiku-4-5')
 }
 
 export interface RegisteredGroup {

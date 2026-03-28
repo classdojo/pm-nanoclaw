@@ -17,9 +17,82 @@ import {
   updateTaskAfterRun,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
+import path from 'path';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
+import { readEnvFile } from './env.js';
+
+// ── Cost Tracking ───────────────────────────────────────────────────────────
+
+const COST_FILE = path.join(process.cwd(), 'store', 'cost-tracker.json');
+
+interface CostEntry {
+  date: string; // YYYY-MM-DD
+  group: string;
+  runs: number;
+  totalCostUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+interface CostTracker {
+  entries: CostEntry[];
+  dailyBudgetUsd: number; // 0 = unlimited
+}
+
+function loadCostTracker(): CostTracker {
+  try {
+    return JSON.parse(fs.readFileSync(COST_FILE, 'utf-8'));
+  } catch {
+    return { entries: [], dailyBudgetUsd: 5.0 };
+  }
+}
+
+function saveCostTracker(tracker: CostTracker): void {
+  fs.writeFileSync(COST_FILE, JSON.stringify(tracker, null, 2));
+}
+
+export function trackCost(
+  group: string,
+  costUsd?: number,
+  usage?: { input_tokens?: number; output_tokens?: number },
+): void {
+  const tracker = loadCostTracker();
+  const today = new Date().toISOString().slice(0, 10);
+  let entry = tracker.entries.find((e) => e.date === today && e.group === group);
+  if (!entry) {
+    entry = { date: today, group, runs: 0, totalCostUsd: 0, inputTokens: 0, outputTokens: 0 };
+    tracker.entries.push(entry);
+  }
+  entry.runs++;
+  if (costUsd) entry.totalCostUsd += costUsd;
+  if (usage?.input_tokens) entry.inputTokens += usage.input_tokens;
+  if (usage?.output_tokens) entry.outputTokens += usage.output_tokens;
+
+  // Prune entries older than 30 days
+  const cutoff = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  tracker.entries = tracker.entries.filter((e) => e.date >= cutoff);
+
+  saveCostTracker(tracker);
+}
+
+export function isDailyBudgetExceeded(group: string): boolean {
+  const tracker = loadCostTracker();
+  if (tracker.dailyBudgetUsd <= 0) return false;
+  const today = new Date().toISOString().slice(0, 10);
+  const todayCost = tracker.entries
+    .filter((e) => e.date === today && e.group === group)
+    .reduce((sum, e) => sum + e.totalCostUsd, 0);
+  if (todayCost >= tracker.dailyBudgetUsd) {
+    logger.warn(
+      { group, todayCost, budget: tracker.dailyBudgetUsd },
+      'Daily budget exceeded — skipping scheduled task',
+    );
+    return true;
+  }
+  return false;
+}
 
 /**
  * Compute the next run time for a recurring task, anchored to the
@@ -79,6 +152,13 @@ async function runTask(
   task: ScheduledTask,
   deps: SchedulerDependencies,
 ): Promise<void> {
+  // Check daily budget before running
+  if (isDailyBudgetExceeded(task.group_folder)) {
+    const nextRun = computeNextRun(task);
+    updateTaskAfterRun(task.id, nextRun, 'Skipped: daily budget exceeded');
+    return;
+  }
+
   const startTime = Date.now();
   let groupDir: string;
   try {
@@ -181,6 +261,9 @@ async function runTask(
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
         script: task.script || undefined,
+        allowedTools: group.containerConfig?.allowedTools,
+        additionalMcpServers: group.containerConfig?.additionalMcpServers,
+        model: group.containerConfig?.model,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
@@ -210,8 +293,13 @@ async function runTask(
       result = output.result;
     }
 
+    // Track cost if reported by the agent
+    if (output.totalCostUsd != null || output.usage) {
+      trackCost(task.group_folder, output.totalCostUsd, output.usage);
+    }
+
     logger.info(
-      { taskId: task.id, durationMs: Date.now() - startTime },
+      { taskId: task.id, durationMs: Date.now() - startTime, cost: output.totalCostUsd },
       'Task completed',
     );
   } catch (err) {
@@ -222,14 +310,32 @@ async function runTask(
 
   const durationMs = Date.now() - startTime;
 
+  const runAt = new Date().toISOString();
   logTaskRun({
     task_id: task.id,
-    run_at: new Date().toISOString(),
+    run_at: runAt,
     duration_ms: durationMs,
     status: error ? 'error' : 'success',
     result,
     error,
   });
+
+  // Write a human-readable log file for the group
+  try {
+    const logDir = path.join(resolveGroupFolderPath(task.group_folder), 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    const logFile = path.join(logDir, 'scan-history.log');
+    const entry = `[${runAt}] ${error ? 'ERROR' : 'OK'} (${Math.round(durationMs / 1000)}s)${result ? '\n' + result.slice(0, 500) : error ? '\n' + error : ''}\n---\n`;
+    fs.appendFileSync(logFile, entry);
+    // Rotate: keep last 5GB
+    const stat = fs.statSync(logFile);
+    if (stat.size > 5_000_000_000) {
+      const content = fs.readFileSync(logFile, 'utf-8');
+      fs.writeFileSync(logFile, content.slice(-4_000_000_000));
+    }
+  } catch {
+    // Non-critical, don't crash
+  }
 
   const nextRun = computeNextRun(task);
   const resultSummary = error

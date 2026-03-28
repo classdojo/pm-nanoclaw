@@ -43,6 +43,9 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  allowedTools?: string[];
+  additionalMcpServers?: Record<string, { url: string }>;
+  model?: string;
 }
 
 export interface ContainerOutput {
@@ -50,6 +53,8 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  usage?: { input_tokens?: number; output_tokens?: number };
+  totalCostUsd?: number;
 }
 
 interface VolumeMount {
@@ -227,8 +232,16 @@ async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   agentIdentifier?: string,
+  network?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+
+  // Apply custom Docker network for isolation (e.g., --internal networks block internet)
+  if (network) {
+    args.push('--network', network);
+    // Explicit host mapping required on custom networks for host.docker.internal
+    args.push('--add-host', 'host.docker.internal:host-gateway');
+  }
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -248,8 +261,10 @@ async function buildContainerArgs(
     );
   }
 
-  // Runtime-specific args for host gateway resolution
-  args.push(...hostGatewayArgs());
+  // Runtime-specific args for host gateway resolution (when not on a custom network)
+  if (!network) {
+    args.push(...hostGatewayArgs());
+  }
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
@@ -296,6 +311,7 @@ export async function runContainerAgent(
     mounts,
     containerName,
     agentIdentifier,
+    group.containerConfig?.network,
   );
 
   logger.debug(
@@ -431,15 +447,15 @@ export async function runContainerAgent(
         { group: group.name, containerName },
         'Container timeout, stopping gracefully',
       );
-      exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
-        if (err) {
-          logger.warn(
-            { group: group.name, containerName, err },
-            'Graceful stop failed, force killing',
-          );
-          container.kill('SIGKILL');
-        }
-      });
+      try {
+        stopContainer(containerName);
+      } catch (err: unknown) {
+        logger.warn(
+          { group: group.name, containerName, err },
+          'Graceful stop failed, force killing',
+        );
+        container.kill('SIGKILL');
+      }
     };
 
     let timeout = setTimeout(killOnTimeout, timeoutMs);

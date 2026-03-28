@@ -63,6 +63,9 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { readEnvFile } from './env.js';
+import { startGateway } from './pm-gateway/server.js';
+import { startDashboard } from './pm-dashboard/server.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -390,6 +393,9 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        allowedTools: group.containerConfig?.allowedTools,
+        additionalMcpServers: group.containerConfig?.additionalMcpServers,
+        model: group.containerConfig?.model,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -725,6 +731,35 @@ async function main(): Promise<void> {
       }
     },
   });
+  // Start PM Gateway MCP server if configured
+  const gatewayEnv = readEnvFile(['PM_GATEWAY_PORT', 'PM_GATEWAY_SLACK_TOKEN', 'SLACK_BOT_TOKEN']);
+  if (gatewayEnv.PM_GATEWAY_PORT) {
+    const port = parseInt(gatewayEnv.PM_GATEWAY_PORT, 10);
+    // Prefer dedicated gateway token (user token for reading as the user),
+    // fall back to bot token
+    const slackToken = gatewayEnv.PM_GATEWAY_SLACK_TOKEN || gatewayEnv.SLACK_BOT_TOKEN;
+    if (slackToken) {
+      startGateway(port, slackToken);
+    } else {
+      logger.warn('PM_GATEWAY_PORT set but no Slack token found — gateway not started');
+    }
+  }
+
+  // Start PM Dashboard if pm-monitor group exists
+  const pmMonitorGroup = Object.values(registeredGroups).find(
+    (g) => g.folder === 'pm-monitor',
+  );
+  if (pmMonitorGroup) {
+    const dashboardPort = parseInt(
+      readEnvFile(['PM_DASHBOARD_PORT']).PM_DASHBOARD_PORT || '9821',
+      10,
+    );
+    startDashboard(
+      dashboardPort,
+      path.join(GROUPS_DIR, 'pm-monitor'),
+    );
+  }
+
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
   startMessageLoop().catch((err) => {

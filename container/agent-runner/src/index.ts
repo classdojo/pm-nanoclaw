@@ -29,6 +29,9 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  allowedTools?: string[];
+  additionalMcpServers?: Record<string, { url: string }>;
+  model?: string;
 }
 
 interface ContainerOutput {
@@ -36,6 +39,8 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  usage?: { input_tokens?: number; output_tokens?: number };
+  totalCostUsd?: number;
 }
 
 interface SessionEntry {
@@ -401,7 +406,8 @@ async function runQuery(
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,
-      allowedTools: [
+      model: containerInput.model,
+      allowedTools: containerInput.allowedTools ?? [
         'Bash',
         'Read', 'Write', 'Edit', 'Glob', 'Grep',
         'WebSearch', 'WebFetch',
@@ -425,6 +431,14 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        // Merge additional MCP servers from container config (e.g., pm-gateway)
+        ...(containerInput.additionalMcpServers
+          ? Object.fromEntries(
+              Object.entries(containerInput.additionalMcpServers).map(
+                ([name, cfg]) => [name, { type: 'http' as const, url: cfg.url }]
+              )
+            )
+          : {}),
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
@@ -452,11 +466,17 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
+      const usage = 'usage' in message ? (message as Record<string, unknown>).usage as Record<string, number> | undefined : undefined;
+      const totalCost = 'total_cost_usd' in message ? (message as Record<string, unknown>).total_cost_usd as number | undefined : undefined;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      if (usage) log(`Usage: ${JSON.stringify(usage)}`);
+      if (totalCost != null) log(`Cost: $${totalCost.toFixed(4)}`);
       writeOutput({
         status: 'success',
         result: textResult || null,
-        newSessionId
+        newSessionId,
+        usage: usage || undefined,
+        totalCostUsd: totalCost ?? undefined,
       });
     }
   }
